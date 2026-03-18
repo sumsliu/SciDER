@@ -66,7 +66,27 @@ class Message(LLMessage):
 
     @classmethod
     def from_ll_message(cls, msg: LLMessage) -> "Message":
-        o = cls(**msg.__dict__)
+        # Handle both litellm.Message and OpenAI ChatCompletionMessage
+        if hasattr(msg, '__dict__'):
+            msg_dict = msg.__dict__.copy()
+        else:
+            # Convert OpenAI message to dict
+            msg_dict = msg.model_dump() if hasattr(msg, 'model_dump') else dict(msg)
+
+        # Convert OpenAI tool_calls to litellm format if needed
+        if 'tool_calls' in msg_dict and msg_dict['tool_calls']:
+            from openai.types.chat import ChatCompletionMessageToolCall as OpenAIToolCall
+            tool_calls = []
+            for tc in msg_dict['tool_calls']:
+                if isinstance(tc, dict):
+                    tool_calls.append(tc)
+                elif hasattr(tc, 'model_dump'):
+                    tool_calls.append(tc.model_dump())
+                else:
+                    tool_calls.append(tc)
+            msg_dict['tool_calls'] = tool_calls
+
+        o = cls(**msg_dict)
         return o
 
     @property
@@ -94,10 +114,23 @@ class Message(LLMessage):
     def reasoning_text(self, value: str | None):
         self.reasoning_content = value
 
-    def to_ll_message(self, exclude_none: bool = True) -> LLMessage | dict:
-        return LLMessage(
-            **self.model_dump(exclude=self.__CUSTOM_FIELDS__, exclude_none=exclude_none)  # type: ignore
-        )
+    def to_ll_message(self, exclude_none: bool = True) -> dict:
+        """Convert to OpenAI-compatible message dict"""
+        msg_dict = self.model_dump(exclude=self.__CUSTOM_FIELDS__, exclude_none=exclude_none)
+
+        # Ensure tool_calls are in the correct format for OpenAI
+        if msg_dict.get('tool_calls'):
+            tool_calls = []
+            for tc in msg_dict['tool_calls']:
+                if isinstance(tc, dict):
+                    tool_calls.append(tc)
+                elif hasattr(tc, 'model_dump'):
+                    tool_calls.append(tc.model_dump())
+                else:
+                    tool_calls.append(tc)
+            msg_dict['tool_calls'] = tool_calls
+
+        return msg_dict
 
     def to_ll_response_message(
         self,

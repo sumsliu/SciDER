@@ -1,3 +1,4 @@
+from scider.default.models.ark import register_ark_models
 from scider.default.models.gemini import (
     register_gemini3_medium_high_models,
     register_gemini_low_medium_models,
@@ -9,6 +10,7 @@ from scider.default.models.gpt import (
 )
 
 __all__ = [
+    "register_ark_models",
     "register_gemini_low_medium_models",
     "register_gemini_medium_high_models",
     "register_gemini3_medium_high_models",

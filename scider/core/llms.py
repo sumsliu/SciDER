@@ -4,14 +4,13 @@ from threading import RLock
 from time import sleep
 from typing import Callable
 
-import litellm
 from functional import seq
-from litellm import RateLimitError, ServiceUnavailableError
-from litellm.types.utils import Usage
 from loguru import logger
+from openai import OpenAI, APITimeoutError, RateLimitError as OpenAIRateLimitError, APIError
 
 from ..tools import ToolRegistry
 from .constant import __AGENT_STATE_NAME__
+from .message_utils import validate_and_clean_messages
 from .types import Message
 
 
@@ -84,7 +83,7 @@ class ModelRegistry:
         for attempt in range(max_retries):
             try:
                 return cls._completion(*args, **kwargs)
-            except RateLimitError as e:
+            except OpenAIRateLimitError as e:
                 rate_limit_delay = 65  # seconds
                 if attempt == max_retries - 1:
                     # Last attempt failed, re-raise
@@ -103,11 +102,12 @@ class ModelRegistry:
                     f"Encountered ZeroChoiceError({str(e)}) in LLM completion. Retrying {attempt + 1}/{max_retries} after 45 seconds..."
                 )
                 sleep(45)  # brief wait before retry
-            except ServiceUnavailableError as e:
+            except APIError as e:
+                # Handle service unavailable and other API errors
                 if attempt == max_retries - 1:
                     raise
                 logger.warning(
-                    f"Encountered ServiceUnavailableError({str(e)}) in LLM completion. Retrying {attempt + 1}/{max_retries} after 60 seconds..."
+                    f"Encountered APIError({str(e)}) in LLM completion. Retrying {attempt + 1}/{max_retries} after 60 seconds..."
                 )
                 sleep(60)  # brief wait before retry
 
@@ -132,137 +132,76 @@ class ModelRegistry:
         messages = [Message(role="system", content=system_prompt)] + history
 
         model_params: dict = cls.instance().get_model_params(name)
-        llm_model: str = model_params["model"]
 
-        if llm_model.startswith("gpt-5"):
-            logger.trace("Using GPT-5 Response API for model: {}", name)
+        logger.trace("Using OpenAI SDK for model: {}", name)
 
-            from litellm import responses as ll_responses
+        # Use OpenAI SDK directly
+        model_params_copy = model_params.copy()
 
-            # response API has different tool schema
-            res_tools = (
-                seq(tools_json_schemas)
-                .map(lambda schema: {"type": "function", **schema["function"]})
-                .to_list()
-            )
+        # Create OpenAI client with custom base_url if provided
+        client_kwargs = {}
+        if model_params_copy.get("base_url"):
+            client_kwargs["base_url"] = model_params_copy.pop("base_url")
+        if model_params_copy.get("api_key"):
+            client_kwargs["api_key"] = model_params_copy.pop("api_key")
 
-            input = []
-            for msg in messages:
-                input.extend(msg.to_ll_response_message())
+        client = OpenAI(**client_kwargs)
 
-            params = model_params.copy()
-            params.update(kwargs)
-            params.update(
-                {
-                    "input": input,
-                    "tools": res_tools,
-                    "tool_choice": tool_choice,
-                }
-            )
+        # Prepare messages
+        openai_messages = [msg.to_ll_message() for msg in messages]
 
-            response = ll_responses(**params)
-            # print(response.model_dump_json(indent=2))
-            logger.trace("GPT-5 Response API response: {}", response.model_dump_json(indent=2))
+        # Validate and clean message sequence for OpenAI API compatibility
+        openai_messages = validate_and_clean_messages(openai_messages)
 
-            ## tool calls
-            tool_calls = (
-                seq(response.output)
-                .filter(lambda c: c.type == "function_call")
-                .map(
-                    lambda c: litellm.ChatCompletionMessageToolCall(
-                        id=c.id,
-                        function=litellm.Function(
-                            name=c.name,
-                            arguments=c.arguments,
-                        ),
-                    )
-                )
-                .to_list()
-            )
-            ## message content
-            msg_content = (
-                seq(response.output)
-                .filter(lambda c: c.type == "message")
-                .map(lambda c: c.content)
-                .to_list()
-            )
-            if len(msg_content) == 0:
-                msg_content = None
-            else:
-                msg_content = msg_content[0][0].text
+        # Prepare request parameters
+        request_params = {
+            "model": model_params_copy["model"],
+            "messages": openai_messages,
+        }
 
-            # check if both content and tool_calls are empty
-            if msg_content is None and len(tool_calls) == 0:
-                raise ZeroChoiceError("No content or tool calls returned from response API")
+        # Add tools if provided
+        if tools_json_schemas:
+            request_params["tools"] = tools_json_schemas
+        if tool_choice:
+            request_params["tool_choice"] = tool_choice
 
-            ## usage
-            usage = response.usage  # type: ignore
-            ## reasoning content
-            reasoning_msg_block = (
-                seq(response.output)
-                .filter(lambda c: c.type == "reasoning")
-                .filter(lambda c: len(c.summary) > 0)
-                .head_option(no_wrap=True)
-            )
-            if reasoning_msg_block:
-                reasoning_summaries = (
-                    seq(reasoning_msg_block.summary)
-                    .filter(lambda s: s.type == "summary_text")
-                    .map(lambda s: s.text)
-                    .to_list()
-                )
-                reasoning_text = "\n".join(reasoning_summaries)
-            else:
-                reasoning_text = None
+        # Add any additional kwargs
+        request_params.update(kwargs)
 
-            ## construct message
-            msg: Message = Message(
-                role="assistant",
-                content=msg_content,
-                tool_calls=tool_calls,
-                llm_sender=name,
-                agent_sender=agent_sender,
-                completion_tokens=usage.output_tokens,
-                prompt_tokens=usage.input_tokens,
-                reasoning_content=reasoning_text,
-            )
-            return msg
-        else:
-            logger.trace("Using completion API for model: {}", name)
+        # Make API call
+        response = client.chat.completions.create(**request_params)
 
-            # completion API
-            from litellm import completion as ll_completion
+        if not response.choices or len(response.choices) == 0:
+            raise ZeroChoiceError("No choices returned from OpenAI API")
 
-            params = model_params.copy()
-            params.update(kwargs)
-            params.update(
-                {
-                    "messages": (seq(messages).map(lambda msg: msg.to_ll_message()).to_list()),
-                    "tools": tools_json_schemas,
-                    "tool_choice": tool_choice,
-                }
-            )
-
-            response = ll_completion(**params)
-            if response.choices is None or len(response.choices) == 0:
-                raise ZeroChoiceError("No choices returned from completion API")
-            msg: Message = Message.from_ll_message(response.choices[0].message)  # type: ignore
-            usage: Usage = response.usage  # type: ignore
-            msg.llm_sender = name
-            msg.agent_sender = agent_sender
-            msg.completion_tokens = usage.completion_tokens
-            msg.prompt_tokens = usage.prompt_tokens
-            return msg
+        # Convert response to Message
+        msg: Message = Message.from_ll_message(response.choices[0].message)
+        msg.llm_sender = name
+        msg.agent_sender = agent_sender
+        msg.completion_tokens = response.usage.completion_tokens if response.usage else 0
+        msg.prompt_tokens = response.usage.prompt_tokens if response.usage else 0
+        return msg
 
     @classmethod
     def embedding(cls, name: str, texts: list[str], **kwargs) -> list[list[float]]:
         """Returns a list of embeddings for the given texts."""
-        from litellm import embedding as ll_embedding
-
         model_params: dict = cls.instance().models[name]
-        params = model_params.copy()
-        params.update(kwargs)
-        params.update({"input": texts})
 
-        response = ll_embedding(**params)
-        return [d["embedding"] for d in response.data]
+        # Create OpenAI client with custom base_url if provided
+        client_kwargs = {}
+        if model_params.get("base_url"):
+            client_kwargs["base_url"] = model_params["base_url"]
+        if model_params.get("api_key"):
+            client_kwargs["api_key"] = model_params["api_key"]
+
+        client = OpenAI(**client_kwargs)
+
+        # Make API call
+        response = client.embeddings.create(
+            model=model_params["model"],
+            input=texts,
+            **kwargs
+        )
+
+        return [d.embedding for d in response.data]
+

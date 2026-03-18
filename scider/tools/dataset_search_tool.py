@@ -62,7 +62,21 @@ class PapersWithCodeRepository(DatasetRepository):
             }
 
             logger.debug(f"Papers with Code search URL: {base_url} with params: {params}")
-            response = requests.get(base_url, params=params, headers=headers, timeout=10)
+
+            # Increase timeout and add retry logic for Papers with Code
+            max_retries = 2
+            for attempt in range(max_retries):
+                try:
+                    response = requests.get(base_url, params=params, headers=headers, timeout=30)
+                    break
+                except requests.exceptions.Timeout:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Papers with Code timeout, retrying ({attempt + 1}/{max_retries})...")
+                        time.sleep(2)
+                        continue
+                    else:
+                        logger.warning("Papers with Code API timeout after retries, skipping")
+                        return []
 
             # Check response status
             if response.status_code != 200:
@@ -165,9 +179,9 @@ class HuggingFaceRepository(DatasetRepository):
         self, query: str, domain: Optional[str] = None, max_results: int = 10
     ) -> List[Dataset]:
         try:
-            # Hugging Face API endpoint
+            # Hugging Face API endpoint (using HF Mirror for China)
             # Try multiple query formats for better results
-            base_url = "https://huggingface.co/api/datasets"
+            base_url = "https://hf-mirror.com/api/datasets"
 
             # Add headers
             headers = {
@@ -320,7 +334,7 @@ class HuggingFaceRepository(DatasetRepository):
                     # Try to get more details (but don't fail if it doesn't work)
                     description = "No description available"
                     try:
-                        detail_url = f"https://huggingface.co/api/datasets/{dataset_id}"
+                        detail_url = f"https://hf-mirror.com/api/datasets/{dataset_id}"
                         detail_response = requests.get(detail_url, timeout=5)
                         if detail_response.status_code == 200:
                             detail_data = detail_response.json()
@@ -344,9 +358,9 @@ class HuggingFaceRepository(DatasetRepository):
                         description=description,
                         domain=domain_str,
                         size=str(item.get("downloads", "Unknown")),
-                        url=f"https://huggingface.co/datasets/{dataset_id}",
+                        url=f"https://hf-mirror.com/datasets/{dataset_id}",
                         source="Hugging Face",
-                        download_url=f"https://huggingface.co/datasets/{dataset_id}",
+                        download_url=f"https://hf-mirror.com/datasets/{dataset_id}",
                         license=item.get("license") or "Unknown",
                     )
                     datasets.append(dataset)

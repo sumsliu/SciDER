@@ -12,7 +12,7 @@ authors = [
     { name = "Yilin Lu", email = "lu000661@umn.edu" }
 ]
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "beautifulsoup4>=4.14.2",
     "claude-agent-sdk>=0.1.33",
