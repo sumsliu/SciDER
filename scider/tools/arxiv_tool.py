@@ -1,7 +1,9 @@
 import json
+import sys
 import time
 import urllib.parse
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import feedparser
@@ -9,6 +11,14 @@ import requests
 from loguru import logger
 
 from .registry import register_tool, register_toolset_desc
+
+for _parent in Path(__file__).resolve().parents:
+    _candidate = _parent / "tools" / "literature_manager" / "src"
+    if _candidate.exists():
+        sys.path.insert(0, str(_candidate))
+        break
+
+from literature_manager.provider_http import AcademicHTTPClient
 
 register_toolset_desc("paper_search", "Search for academic papers across multiple repositories.")
 
@@ -157,6 +167,9 @@ class MedRxivRepository(PaperRepository):
 
 
 class SemanticScholarRepository(PaperRepository):
+    def __init__(self) -> None:
+        self.http = AcademicHTTPClient()
+
     def search(self, query: str, max_results: int = 10) -> List[Paper]:
         try:
             base_url = "https://api.semanticscholar.org/graph/v1/paper/search"
@@ -168,7 +181,7 @@ class SemanticScholarRepository(PaperRepository):
 
             headers = {"Accept": "application/json"}
 
-            response = requests.get(base_url, params=params, headers=headers)
+            response = self.http.get("semantic", base_url, params=params, headers=headers)
 
             # Handle rate limiting gracefully
             if response.status_code == 429:
@@ -233,8 +246,21 @@ class PaperSearch:
                     # The error message is already descriptive in the exception
                     continue
 
-        # Sort by published date (newest first)
-        all_papers.sort(key=lambda x: x.published, reverse=True)
+        def _parse_date_key(paper: Paper) -> str:
+            """Normalize date strings for consistent sorting across sources."""
+            raw = (paper.published or "").strip()
+            if not raw:
+                return "0000-00-00"
+            import re as _re
+            m = _re.search(r'(\d{4})-(\d{2})-(\d{2})', raw)
+            if m:
+                return m.group(0)
+            m = _re.search(r'(\d{4})', raw)
+            if m:
+                return f"{m.group(1)}-01-01"
+            return "0000-00-00"
+
+        all_papers.sort(key=_parse_date_key, reverse=True)
         return all_papers[:max_results]
 
 
